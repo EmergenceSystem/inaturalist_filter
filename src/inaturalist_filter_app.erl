@@ -4,8 +4,8 @@
 %% Application callbacks
 -export([start/2, stop/1]).
 
-%% Cowboy handler callbacks
--export([init/2, terminate/3]).
+%% Handler callbacks
+-export([handle/1]).
 
 -define(INATURALIST_AUTOCOMPLETE_URL, "https://api.inaturalist.org/v1/taxa/autocomplete").
 -define(INATURALIST_TAXA_URL, "https://api.inaturalist.org/v1/taxa").
@@ -18,22 +18,21 @@ start(_StartType, _StartArgs) ->
 stop(_State) ->
     ok.
 
-%% Cowboy handler behavior
-init(Req0, State) ->
-    {ok, Body, Req} = cowboy_req:read_body(Req0),
-    io:format("Received body: ~p~n", [Body]),
-    EmbryoList = generate_embryo_list(Body),
-    Response = #{embryo_list => EmbryoList},
-    EncodedResponse = jsone:encode(Response),
-    Req2 = cowboy_req:reply(200,
-        #{<<"content-type">> => <<"application/json">>},
-        EncodedResponse,
-        Req
-    ),
-    {ok, Req2, State}.
+%% @doc Handle incoming requests from the filter server.
+%% This function is called by em_filter_server through Wade.
+%% @param Body The request body (JSON binary or string)
+%% @return JSON response as binary or string
+handle(Body) when is_binary(Body) ->
+    handle(binary_to_list(Body));
 
-terminate(_Reason, _Req, _State) ->
-    ok.
+handle(Body) when is_list(Body) ->
+    io:format("Bing Filter received body: ~p~n", [Body]),
+    EmbryoList = generate_embryo_list(list_to_binary(Body)),
+    Response = #{embryo_list => EmbryoList},
+    jsone:encode(Response);
+
+handle(_) ->
+    jsone:encode(#{error => <<"Invalid request body">>}).
 
 generate_embryo_list(JsonBinary) ->
     Search = case jsone:decode(JsonBinary, [{keys, atom}]) of

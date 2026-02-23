@@ -1,31 +1,63 @@
 %%%-------------------------------------------------------------------
-%%% @doc iNaturalist taxa search filter.
+%%% @doc iNaturalist taxa search agent.
 %%%
-%%% Queries the iNaturalist autocomplete API and returns matching
-%%% taxa as embryo maps with scientific name, common name, rank,
-%%% observation count and Wikipedia URL.
+%%% As an agent this module:
+%%%   - Announces capabilities to em_disco on startup via `agent_hello'.
+%%%   - Maintains a memory of Wikipedia URLs already returned, so
+%%%     duplicate taxa across successive queries are filtered out.
+%%%
+%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
+%%% Returns a raw Erlang list — em_filter_server encodes it.
+%%% Memory schema: `#{seen => #{binary_url => true}}'.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(inaturalist_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/1]).
+-export([handle/1, handle/2]).
 
 -define(AUTOCOMPLETE_URL, "https://api.inaturalist.org/v1/taxa/autocomplete").
+
+-define(CAPABILITIES, [
+    <<"inaturalist">>,
+    <<"biology">>,
+    <<"nature">>,
+    <<"taxonomy">>,
+    <<"species">>
+]).
 
 %%====================================================================
 %% Application behaviour
 %%====================================================================
 
 start(_StartType, _StartArgs) ->
-    em_filter:start_filter(inaturalist_filter, ?MODULE).
+    em_filter:start_agent(inaturalist_filter, ?MODULE, #{
+        capabilities => ?CAPABILITIES,
+        memory       => ets
+    }).
 
 stop(_State) ->
     em_filter:stop_filter(inaturalist_filter).
 
 %%====================================================================
-%% Filter handler — returns a list of embryo maps
+%% Agent handler — with memory (primary path)
+%%====================================================================
+
+handle(Body, Memory) when is_binary(Body) ->
+    Seen    = maps:get(seen, Memory, #{}),
+    Embryos = generate_embryo_list(Body),
+    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
+    NewSeen = lists:foldl(fun(E, Acc) ->
+        Acc#{url_of(E) => true}
+    end, Seen, Fresh),
+    {Fresh, Memory#{seen => NewSeen}};
+
+handle(_Body, Memory) ->
+    {[], Memory}.
+
+%%====================================================================
+%% Plain filter handler — backward compatibility
 %%====================================================================
 
 handle(Body) when is_binary(Body) ->
@@ -34,7 +66,7 @@ handle(_) ->
     [].
 
 %%====================================================================
-%% Search and processing
+%% Search and processing (unchanged)
 %%====================================================================
 
 generate_embryo_list(JsonBinary) ->
@@ -52,11 +84,11 @@ generate_embryo_list(JsonBinary) ->
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            Value      = binary_to_list(maps:get(<<"value">>,            Map, <<"">>)),
-            Timeout    = parse_int(maps:get(<<"timeout">>,         Map, 10), 10),
-            Rank       = binary_to_list(maps:get(<<"rank">>,             Map, <<"">>)),
-            MinObs     = parse_int(maps:get(<<"min_observations">>, Map, 0),  0),
-            IconicTaxon= binary_to_list(maps:get(<<"iconic_taxon_id">>,  Map, <<"">>)),
+            Value       = binary_to_list(maps:get(<<"value">>,           Map, <<"">>)),
+            Timeout     = parse_int(maps:get(<<"timeout">>,        Map, 10), 10),
+            Rank        = binary_to_list(maps:get(<<"rank">>,            Map, <<"">>)),
+            MinObs      = parse_int(maps:get(<<"min_observations">>, Map, 0),  0),
+            IconicTaxon = binary_to_list(maps:get(<<"iconic_taxon_id">>, Map, <<"">>)),
             {Value, Timeout, Rank, MinObs, IconicTaxon};
         _ ->
             {binary_to_list(JsonBinary), 10, "", 0, ""}
@@ -80,10 +112,6 @@ build_search_url(Query, Rank, IconicTaxon) ->
 
 add_param(_Key, "",    Acc) -> Acc;
 add_param(Key,  Value, Acc) -> [Key ++ "=" ++ Value | Acc].
-
-%%--------------------------------------------------------------------
-%% Result parsing
-%%--------------------------------------------------------------------
 
 parse_results(JsonData, SearchValue, TimeoutSecs, MinObs) ->
     try json:decode(JsonData) of
@@ -109,12 +137,12 @@ process_taxa([Taxon | Rest], Value, Start, Timeout, MinObs, Acc) ->
     end.
 
 build_embryo(Taxon, SearchValue, MinObs) ->
-    Name        = safe_str(maps:get(<<"name">>,                   Taxon, <<"">>)),
-    CommonName  = safe_str(maps:get(<<"preferred_common_name">>,  Taxon, <<"">>)),
-    Rank        = safe_str(maps:get(<<"rank">>,                   Taxon, <<"">>)),
-    ObsCount    = maps:get(<<"observations_count">>,              Taxon, 0),
-    WikiUrl     = safe_str(maps:get(<<"wikipedia_url">>,          Taxon, <<"">>)),
-    IconicTaxon = safe_str(maps:get(<<"iconic_taxon_name">>,      Taxon, <<"">>)),
+    Name        = safe_str(maps:get(<<"name">>,                  Taxon, <<"">>)),
+    CommonName  = safe_str(maps:get(<<"preferred_common_name">>, Taxon, <<"">>)),
+    Rank        = safe_str(maps:get(<<"rank">>,                  Taxon, <<"">>)),
+    ObsCount    = maps:get(<<"observations_count">>,             Taxon, 0),
+    WikiUrl     = safe_str(maps:get(<<"wikipedia_url">>,         Taxon, <<"">>)),
+    IconicTaxon = safe_str(maps:get(<<"iconic_taxon_name">>,     Taxon, <<"">>)),
     PhotoUrl    = case maps:get(<<"default_photo">>, Taxon, #{}) of
         P when is_map(P) -> safe_str(maps:get(<<"medium_url">>, P, <<"">>));
         _                -> ""
@@ -125,14 +153,14 @@ build_embryo(Taxon, SearchValue, MinObs) ->
             Resume = build_resume(Name, CommonName, Rank, ObsCount, IconicTaxon),
             {ok, #{
                 <<"properties">> => #{
-                    <<"url">>               => list_to_binary(WikiUrl),
-                    <<"resume">>            => list_to_binary(Resume),
-                    <<"photo_url">>         => list_to_binary(PhotoUrl),
-                    <<"scientific_name">>   => list_to_binary(Name),
-                    <<"common_name">>       => list_to_binary(CommonName),
-                    <<"rank">>              => list_to_binary(Rank),
-                    <<"observations_count">>=> ObsCount,
-                    <<"iconic_taxon">>      => list_to_binary(IconicTaxon)
+                    <<"url">>                => list_to_binary(WikiUrl),
+                    <<"resume">>             => list_to_binary(Resume),
+                    <<"photo_url">>          => list_to_binary(PhotoUrl),
+                    <<"scientific_name">>    => list_to_binary(Name),
+                    <<"common_name">>        => list_to_binary(CommonName),
+                    <<"rank">>               => list_to_binary(Rank),
+                    <<"observations_count">> => ObsCount,
+                    <<"iconic_taxon">>       => list_to_binary(IconicTaxon)
                 }
             }}
     end.
@@ -153,8 +181,16 @@ build_resume(Name, CommonName, Rank, ObsCount, IconicTaxon) ->
                   " - ", integer_to_list(ObsCount), " observations",
                   " - ", IconicTaxon]).
 
-safe_str(null)      -> "";
-safe_str(undefined) -> "";
-safe_str(<<>>)      -> "";
+safe_str(null)                -> "";
+safe_str(undefined)           -> "";
+safe_str(<<>>)                -> "";
 safe_str(B) when is_binary(B) -> binary_to_list(B);
-safe_str(_)         -> "".
+safe_str(_)                   -> "".
+
+%%====================================================================
+%% Internal helpers
+%%====================================================================
+
+-spec url_of(map()) -> binary().
+url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
+url_of(_) -> <<>>.

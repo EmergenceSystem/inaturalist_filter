@@ -1,29 +1,32 @@
 %%%-------------------------------------------------------------------
 %%% @doc iNaturalist taxa search agent.
 %%%
-%%% Announces capabilities to em_disco on startup and maintains a
-%%% memory of Wikipedia URLs already returned so duplicate taxa across
-%%% successive queries are filtered out.
+%%% Deduplication by URL is handled upstream by the Emquest pipeline.
 %%%
-%%% Handler contract: `handle/2' (Body, Memory) -> {RawList, NewMemory}.
-%%% Memory schema: `#{seen => #{binary_url => true}}'.
+%%% === Capability cascade ===
+%%%
+%%%   base_capabilities/0 extends em_filter:base_capabilities().
+%%%
+%%% Handler contract: handle/2 (Body, Memory) -> {RawList, Memory}.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(inaturalist_filter_app).
 -behaviour(application).
 
 -export([start/2, stop/1]).
--export([handle/2]).
+-export([handle/2, base_capabilities/0]).
 
 -define(AUTOCOMPLETE_URL, "https://api.inaturalist.org/v1/taxa/autocomplete").
 
--define(CAPABILITIES, [
-    <<"inaturalist">>,
-    <<"biology">>,
-    <<"nature">>,
-    <<"taxonomy">>,
-    <<"species">>
-]).
+%%====================================================================
+%% Capability cascade
+%%====================================================================
+
+-spec base_capabilities() -> [binary()].
+base_capabilities() ->
+    em_filter:base_capabilities() ++ [<<"inaturalist">>, <<"biology">>,
+                                      <<"nature">>, <<"taxonomy">>,
+                                      <<"species">>].
 
 %%====================================================================
 %% Application behaviour
@@ -31,9 +34,9 @@
 
 start(_StartType, _StartArgs) ->
     em_filter:start_agent(inaturalist_filter, ?MODULE, #{
-        capabilities => ?CAPABILITIES,
-        memory       => ets
-    }).
+        capabilities => base_capabilities()
+    }),
+    {ok, self()}.
 
 stop(_State) ->
     em_filter:stop_agent(inaturalist_filter).
@@ -43,14 +46,7 @@ stop(_State) ->
 %%====================================================================
 
 handle(Body, Memory) when is_binary(Body) ->
-    Seen    = maps:get(seen, Memory, #{}),
-    Embryos = generate_embryo_list(Body),
-    Fresh   = [E || E <- Embryos, not maps:is_key(url_of(E), Seen)],
-    NewSeen = lists:foldl(fun(E, Acc) ->
-        Acc#{url_of(E) => true}
-    end, Seen, Fresh),
-    {Fresh, Memory#{seen => NewSeen}};
-
+    {generate_embryo_list(Body), Memory};
 handle(_Body, Memory) ->
     {[], Memory}.
 
@@ -73,7 +69,8 @@ generate_embryo_list(JsonBinary) ->
 extract_params(JsonBinary) ->
     try json:decode(JsonBinary) of
         Map when is_map(Map) ->
-            Value       = binary_to_list(maps:get(<<"value">>,           Map, <<"">>)),
+            Value       = binary_to_list(maps:get(<<"value">>,           Map,
+                              maps:get(<<"query">>, Map, <<"">>))),
             Timeout     = parse_int(maps:get(<<"timeout">>,        Map, 10), 10),
             Rank        = binary_to_list(maps:get(<<"rank">>,            Map, <<"">>)),
             MinObs      = parse_int(maps:get(<<"min_observations">>, Map, 0),  0),
@@ -86,9 +83,9 @@ extract_params(JsonBinary) ->
     end.
 
 parse_int(V, _D) when is_integer(V) -> V;
-parse_int(V, D) when is_binary(V) ->
+parse_int(V,  D) when is_binary(V)  ->
     try binary_to_integer(V) catch _:_ -> D end;
-parse_int(_, D) -> D.
+parse_int(_,  D) -> D.
 
 build_search_url(Query, Rank, IconicTaxon) ->
     Params = add_param("iconic_taxon_id", IconicTaxon,
@@ -175,7 +172,3 @@ safe_str(undefined)           -> "";
 safe_str(<<>>)                -> "";
 safe_str(B) when is_binary(B) -> binary_to_list(B);
 safe_str(_)                   -> "".
-
--spec url_of(map()) -> binary().
-url_of(#{<<"properties">> := #{<<"url">> := Url}}) -> Url;
-url_of(_) -> <<>>.
